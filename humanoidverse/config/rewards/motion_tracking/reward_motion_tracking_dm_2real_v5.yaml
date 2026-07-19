@@ -1,0 +1,122 @@
+# @package _global_
+#
+# v5 dab fine-tune reward. Starts from v4's model_41600 (ankle command wind-up
+# already fixed) and targets the REMAINING residuals found in sim:
+#   - crooked spine: policy commands waist_roll ~+10.2 deg (ref wants +2.0) and
+#     waist_pitch ~+2.3 deg (ref wants -21.7) -> 24 deg off.
+#   - yaw drift: ~+8.3 deg/dab free-standing (net +93 deg over 5 dabs).
+#   - left knee ~1.7x busier than right during the dab (opposite the reference).
+#
+# ROOT CAUSE: the tracking sigmas were far too loose. rewards are
+# exp(-err^2/sigma); with sigma=1.0 rad a 24 deg (0.42 rad) error still retains
+# exp(-0.176)=0.84 -> 84% of max reward, so there was almost no gradient pushing
+# the policy to match the reference's joint pose or body rotation. Meanwhile body
+# POSITIONS use sigma 0.03 (30x tighter), so the policy satisfied positions and
+# let joints/rotation drift.
+#
+# FIX: tighten teleop_joint_pos and teleop_body_rot sigma 1.0 -> 0.25 (at 0.25 the
+# same 24 deg error drops to exp(-0.7)=0.50 -> a real gradient). Weights are left
+# at their ORIGINAL values -- v4 proved that bumping the weight is the wrong lever
+# (it scales an already-saturated term); the sigma is what sharpens the gradient.
+#
+# penalty_action_rate restored to -0.5: we lowered it to -0.25 in v4 to fight
+# sluggishness, but the sluggishness turned out to be the 60% runtime gains, not
+# this term. At 100% gains we get snappiness AND can afford the smoother -0.5
+# (the -0.25 likely fed the left-knee back-and-forth jitter).
+
+rewards:
+  set_reward: Tairan
+  set_reward_date: 20241025
+  only_positive_rewards: False
+  reward_scales:
+      teleop_body_position_extend: 1.0
+      teleop_vr_3point: 1.6
+      teleop_body_position_feet: 2.1
+      teleop_body_rotation_extend: 0.5   # back to original; the SIGMA does the work now
+      teleop_body_ang_velocity_extend: 0.5
+      teleop_body_velocity_extend: 0.5
+      teleop_joint_position: 0.75
+      teleop_joint_velocity: 0.5
+      penalty_torques: -0.000001
+      penalty_action_rate: -0.5   # restored (was -0.25 in v4)
+
+      # better for landing
+      penalty_feet_ori: -2.0
+      feet_heading_alignment: -0.1
+      penalty_slippage: -1.0
+
+      limits_dof_pos: -10.0
+      limits_dof_vel: -5.0
+      limits_torque: -5.0
+      # Kills the R_ankle_roll command wind-up (sim masks it; real firmware trips).
+      # Proven in v4: R_ankle_roll target 109.8 deg -> 5.7 deg. KEEP.
+      penalty_dof_pos_command_over_limit: -10.0
+      termination: -200.0
+
+  teleop_body_pos_lowerbody_weight : 0.5
+  teleop_body_pos_upperbody_weight : 1.0
+
+  desired_feet_max_height_for_this_air: 0.2
+
+  reward_tracking_sigma:
+    teleop_upper_body_pos: 0.03
+    teleop_lower_body_pos: 0.1
+    teleop_vr_3point_pos: 0.03
+    teleop_feet_pos: 0.03
+
+    teleop_body_rot: 0.25    # was 1.0 -- TIGHTENED: enforce heading (yaw drift)
+    teleop_body_vel: 1.0
+    teleop_body_ang_vel: 1.0
+    teleop_joint_pos: 0.25   # was 1.0 -- TIGHTENED: enforce spine/joint pose
+    teleop_joint_vel: 1.0
+
+  reward_penalty_curriculum: False
+  reward_initial_penalty_scale : 0.10
+  reward_min_penalty_scale: 0.0
+  reward_max_penalty_scale: 1.0
+  reward_penalty_level_down_threshold: 40
+  reward_penalty_level_up_threshold: 42
+  reward_penalty_degree: 0.000003
+  num_compute_average_epl: 10000
+
+  reward_limit:
+    soft_dof_pos_limit: 0.9
+    soft_dof_vel_limit: 0.9
+    soft_torque_limit: 0.825
+
+    reward_limits_curriculum:
+      soft_dof_pos_curriculum: True
+      soft_dof_pos_initial_limit: 1.15
+      soft_dof_pos_max_limit: 1.15
+      soft_dof_pos_min_limit: 0.95
+      soft_dof_pos_curriculum_degree: 0.00000025
+      soft_dof_pos_curriculum_level_down_threshold: 40
+      soft_dof_pos_curriculum_level_up_threshold: 42
+
+      soft_dof_vel_curriculum: True
+      soft_dof_vel_initial_limit: 1.15
+      soft_dof_vel_max_limit: 1.25
+      soft_dof_vel_min_limit: 0.95
+      soft_dof_vel_curriculum_degree: 0.00000025
+      soft_dof_vel_curriculum_level_down_threshold: 40
+      soft_dof_vel_curriculum_level_up_threshold: 42
+
+      soft_torque_curriculum: True
+      soft_torque_initial_limit: 1.15
+      soft_torque_max_limit: 1.25
+      soft_torque_min_limit: 0.85
+      soft_torque_curriculum_degree: 0.00000025
+      soft_torque_curriculum_level_down_threshold: 40
+      soft_torque_curriculum_level_up_threshold: 42
+
+  reward_penalty_reward_names : [
+    "penalty_torques",
+    "penalty_dof_acc",
+    "penalty_dof_vel",
+    "penalty_action_rate",
+    "limits_dof_pos",
+    "limits_dof_vel",
+    "limits_torque",
+    "feet_heading_alignment",
+    "penalty_feet_ori",
+    "penalty_slippage"]

@@ -27,6 +27,23 @@ from loguru import logger
 from scipy.spatial.transform import Rotation as sRot
 import joblib
 
+# Locomotion default DOF pose in ASAP's 23-DOF order (drops 6 wrist DOFs from
+# the 29-DOF G1 hardware order). Used by the off-trajectory entry feature
+# below to mark a fraction of training rollouts as starting from the
+# locomotion-policy stance with phase=0, so the motion-tracking policy
+# learns to recover from the exact pose it sees at deploy-time FSM switch.
+# Source: rl_sar/policy/g1/robomimic/locomotion/config.yaml default_dof_pos,
+# unscrambled from policy order to SDK order via that config's joint_mapping,
+# then reduced to ASAP's 23-DOF subset (SDK indices 0-18, 22-25).
+LOCO_STANCE_ASAP_23DOF = [
+    -0.20, 0.00, 0.00, 0.42, -0.23, 0.00,   # L leg: hip p/r/y, knee, ank p/r
+    -0.20, 0.00, 0.00, 0.42, -0.23, 0.00,   # R leg: hip p/r/y, knee, ank p/r
+     0.00, 0.00, 0.00,                      # waist: yaw, roll, pitch
+     0.35, 0.18, 0.00, 0.87,                # L arm: sh p/r/y, elbow
+     0.35,-0.18, 0.00, 0.87,                # R arm: sh p/r/y, elbow
+]
+
+
 class LeggedRobotMotionTracking(LeggedRobotBase):
     def __init__(self, config, device):
         self.init_done = False
@@ -217,6 +234,27 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             self.motion_start_times[env_ids] = torch.zeros(len(env_ids), dtype=torch.float32, device=self.device)
         else:
             self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
+
+        # Off-trajectory entry: pick a random subset to start at phase=0 so that
+        # _reset_dofs can inject the locomotion stance pose for those envs. We
+        # mark chosen envs in a long-lived bool buffer (on self.device, matching
+        # motion_start_times and the rest of the env state) so _reset_dofs can
+        # look up by env index without ambiguity about which device anything is
+        # on. We pin the marker to self.device explicitly because env_ids may
+        # arrive on different devices at different points in the lifecycle
+        # (PPO's __init__ triggers a reset_all that comes through here).
+        if not hasattr(self, '_off_traj_entry_marker') or self._off_traj_entry_marker.shape[0] != self.num_envs:
+            self._off_traj_entry_marker = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        env_ids_local = env_ids.to(self.device) if env_ids.device != self.device else env_ids
+        self._off_traj_entry_marker[env_ids_local] = False
+        off_traj_frac = float(self.config.get('off_trajectory_entry_fraction', 0.0))
+        if off_traj_frac > 0.0 and not self.is_evaluating:
+            chosen = torch.rand(len(env_ids_local), device=self.device) < off_traj_frac
+            chosen_env_ids = env_ids_local[chosen]
+            if len(chosen_env_ids) > 0:
+                self._off_traj_entry_marker[chosen_env_ids] = True
+                self.motion_start_times[chosen_env_ids] = 0.0
+                logger.info(f"[off-traj entry] {len(chosen_env_ids)}/{len(env_ids_local)} envs marked for locomotion-stance entry")
         # self.motion_start_times[env_ids] = self._motion_lib.sample_time(self.motion_ids[env_ids])
         # offset = self.env_origins
         # motion_times = (self.episode_length_buf ) * self.dt + self.motion_start_times # next frames so +1
@@ -448,6 +486,49 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
             self.simulator.robot_root_states[env_ids, 7:10] = root_vel + torch.randn_like(root_vel) * root_vel_noise
             self.simulator.robot_root_states[env_ids, 10:13] = root_ang_vel + torch.randn_like(root_ang_vel) * root_ang_vel_noise
 
+        # Off-trajectory entry: dab frame-0 root_rot has the pelvis pitched
+        # ~25deg forward and yawed ~-93deg (mocap actor was facing sideways).
+        # That tilted orientation is incompatible with the upright locomotion-
+        # stance joints we inject in _reset_dofs — the robot would tip forward
+        # immediately. We override the root state to an UPRIGHT pose at rest,
+        # but keeping the motion's yaw so the policy isn't asked to also
+        # realign yaw (which it never trained on doing).
+        marker = getattr(self, '_off_traj_entry_marker', None)
+        if marker is not None and marker.any():
+            in_batch = marker[env_ids]
+            if in_batch.any():
+                idx = env_ids[in_batch]
+                root_states = self.simulator.robot_root_states
+                sim_name = self.config.simulator.config.name
+
+                # Extract yaw from the motion's current root_rot for these envs
+                # (which was set to motion frame-0 just above). Quaternion is
+                # xyzw in IsaacGym/Genesis/MuJoCo; wxyz in IsaacSim.
+                cur_quat = root_states[idx, 3:7]
+                if sim_name == 'isaacsim':
+                    qw, qx, qy, qz = cur_quat[:, 0], cur_quat[:, 1], cur_quat[:, 2], cur_quat[:, 3]
+                else:
+                    qx, qy, qz, qw = cur_quat[:, 0], cur_quat[:, 1], cur_quat[:, 2], cur_quat[:, 3]
+                yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+
+                # Build a yaw-only (upright) quaternion: rotation about world-Z
+                # by `yaw`. Quaternion of axis-angle (axis=Z, angle=yaw):
+                #   x = 0, y = 0, z = sin(yaw/2), w = cos(yaw/2)
+                half = 0.5 * yaw
+                qz_new = torch.sin(half)
+                qw_new = torch.cos(half)
+                zeros = torch.zeros_like(qz_new)
+                if sim_name == 'isaacsim':
+                    upright_yaw_quat = torch.stack([qw_new, zeros, zeros, qz_new], dim=-1)
+                else:
+                    upright_yaw_quat = torch.stack([zeros, zeros, qz_new, qw_new], dim=-1)
+
+                root_states[idx, 3:7] = upright_yaw_quat.to(dtype=root_states.dtype)
+                root_states[idx, 7:10] = 0.0    # zero linear vel
+                root_states[idx, 10:13] = 0.0   # zero angular vel
+                # Keep root_pos[z] at a sensible standing height (~0.78m for G1)
+                root_states[idx, 2] = 0.78
+
 
     def small_random_quaternions(self, n, max_angle):
             axis = torch.randn((n, 3), device=self.device)
@@ -476,8 +557,27 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
 
         dof_pos_noise = self.config.init_noise_scale.dof_pos * self.config.noise_to_initial_level
         dof_vel_noise = self.config.init_noise_scale.dof_vel * self.config.noise_to_initial_level
-        dof_pos = motion_res['dof_pos'][env_ids]
-        dof_vel = motion_res['dof_vel'][env_ids]
+        dof_pos = motion_res['dof_pos'][env_ids].clone()
+        dof_vel = motion_res['dof_vel'][env_ids].clone()
+
+        # Off-trajectory entry: replace the reference frame-0 pose with the
+        # locomotion stance pose for envs that _resample_motion_times marked.
+        # Phase clock for those envs is already at 0 (set above), so the
+        # tracking reference is dab frame 0 — exactly the deploy condition
+        # where rl_sar hands off from locomotion to ASAP at episode_length=0.
+        marker = getattr(self, '_off_traj_entry_marker', None)
+        if marker is not None:
+            env_ids_local = env_ids.to(marker.device) if env_ids.device != marker.device else env_ids
+            in_batch = marker[env_ids_local]
+            if in_batch.any():
+                loco_stance = torch.tensor(
+                    LOCO_STANCE_ASAP_23DOF, device=dof_pos.device, dtype=dof_pos.dtype
+                )
+                # broadcast and assign — noise is still added below
+                in_batch_local = in_batch.to(dof_pos.device)
+                dof_pos[in_batch_local] = loco_stance.unsqueeze(0).expand(int(in_batch_local.sum()), -1)
+                dof_vel[in_batch_local] = 0.0
+
         self.simulator.dof_pos[env_ids] = dof_pos + torch.randn_like(dof_pos) * dof_pos_noise
         self.simulator.dof_vel[env_ids] = dof_vel + torch.randn_like(dof_vel) * dof_vel_noise
 
@@ -607,7 +707,19 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         feet_dist = (feet_diff**2).mean(dim=-1).mean(dim=-1)
         r_feet = torch.exp(-feet_dist / self.config.rewards.reward_tracking_sigma.teleop_feet_pos)
         return r_feet
-    
+
+    def _reward_penalty_feet_pos_deviation(self):
+        # Non-saturating (quadratic) penalty on foot deviation from the reference
+        # foot position. teleop_body_position_feet above is exp() -> it SATURATES,
+        # so once a foot is roughly right there's almost no gradient keeping it
+        # EXACTLY on the reference. This quadratic term keeps a constant gradient,
+        # pushing a planted foot to sit precisely where the reference says --
+        # suppressing the reflex foot-shift on clean entries. The fall/termination
+        # penalty still outweighs this when a step is genuinely needed to survive,
+        # so recovery behavior is preserved (still-when-stable, step-only-to-save).
+        feet_diff = self.dif_global_body_pos[:, self.feet_indices, :]
+        return torch.sum(torch.square(feet_diff), dim=(1, 2))
+
     def _reward_teleop_body_rotation_extend(self):
         rotation_diff = quat_to_angle_axis(self.dif_global_body_rot)[0]
         diff_body_rot_dist = (rotation_diff**2).mean(dim=-1)

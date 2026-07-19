@@ -405,12 +405,17 @@ class PPO(BaseAlgo):
                     torch.log(sigma_batch / old_sigma_batch + 1.e-5) + (torch.square(old_sigma_batch) + torch.square(old_mu_batch - mu_batch)) / (2.0 * torch.square(sigma_batch)) - 0.5, axis=-1)
                 kl_mean = torch.mean(kl)
 
+                # Upper bound on the adaptive LR. Default 1e-2 (unchanged for other
+                # experiments); override with algo.config.max_learning_rate to keep
+                # the adaptive schedule from ratcheting the LR up to a level that
+                # explodes on a bad batch (the v5 dab NaN cause: LR crept toward 1e-2).
+                lr_max = float(self.config.get('max_learning_rate', 1e-2))
                 if kl_mean > self.desired_kl * 2.0:
                     self.actor_learning_rate = max(1e-5, self.actor_learning_rate / 1.5)
                     self.critic_learning_rate = max(1e-5, self.critic_learning_rate / 1.5)
                 elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                    self.actor_learning_rate = min(1e-2, self.actor_learning_rate * 1.5)
-                    self.critic_learning_rate = min(1e-2, self.critic_learning_rate * 1.5)
+                    self.actor_learning_rate = min(lr_max, self.actor_learning_rate * 1.5)
+                    self.critic_learning_rate = min(lr_max, self.critic_learning_rate * 1.5)
 
                 for param_group in self.actor_optimizer.param_groups:
                     param_group['lr'] = self.actor_learning_rate
@@ -447,11 +452,24 @@ class PPO(BaseAlgo):
         critic_loss.backward()
 
         # Gradient step
-        nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-        nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+        actor_gn = nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+        critic_gn = nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
-        self.actor_optimizer.step()
-        self.critic_optimizer.step()
+        # NaN GUARD: if a bad batch produced non-finite loss/gradients, SKIP this
+        # update rather than applying it (which corrupts the policy to NaN and
+        # crashes training, as happened in the v5 dab run). We drop the batch and
+        # continue from the last healthy weights; the next good batch proceeds.
+        if (torch.isfinite(actor_loss) and torch.isfinite(critic_loss)
+                and torch.isfinite(actor_gn) and torch.isfinite(critic_gn)):
+            self.actor_optimizer.step()
+            self.critic_optimizer.step()
+        else:
+            logger.warning(
+                f"[NaN GUARD] skipped update (non-finite): "
+                f"actor_loss={actor_loss.item():.4g} critic_loss={critic_loss.item():.4g} "
+                f"actor_gradnorm={float(actor_gn):.4g} critic_gradnorm={float(critic_gn):.4g}")
+            self.actor_optimizer.zero_grad()
+            self.critic_optimizer.zero_grad()
 
         loss_dict['Value'] += value_loss.item()
         loss_dict['Surrogate'] += surrogate_loss.item()

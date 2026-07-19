@@ -714,6 +714,22 @@ class LeggedRobotBase(BaseTask):
         out_of_limits += (self.simulator.dof_pos - upper_soft_limit).clip(min=0.)
         return torch.sum(out_of_limits, dim=1)
 
+    def _reward_penalty_dof_pos_command_over_limit(self):
+        # Penalize the COMMANDED PD target (action*scale + default_dof_pos) for
+        # exceeding the HARD joint limits. Unlike limits_dof_pos, which reads the
+        # ACHIEVED dof_pos and is blind when foot contact holds a joint in-range,
+        # this reads the COMMAND itself -- so it catches an under-constrained joint
+        # the policy over-commands. Motivating case: the dab's R_ankle_roll wind-up
+        # (~100 deg target) that the sim silently clamps at +-15 deg but the real
+        # robot drives into its hard stop -> ~30 Nm -> firmware power-cut. Only the
+        # out-of-range portion of the command is penalized, so in-range motion
+        # (arms, legs) is untouched.
+        target = self.actions * self.config.robot.control.action_scale + self.default_dof_pos
+        lower = self.simulator.hard_dof_pos_limits[:, 0]
+        upper = self.simulator.hard_dof_pos_limits[:, 1]
+        over = (target - upper).clip(min=0.) + (lower - target).clip(min=0.)
+        return torch.sum(over, dim=1)
+
     def _reward_limits_dof_vel(self):
         # Penalize dof velocities too close to the limit
         # clip to max error = 1 rad/s per joint to avoid huge penalties
