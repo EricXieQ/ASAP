@@ -59,6 +59,11 @@ def main():
                          "env at a fresh random point in its motion, so the gap is "
                          "sampled across the whole trajectory rather than only from "
                          "frame 0.")
+    ap.add_argument("--delta-checkpoint", default=None,
+                    help="a trained delta-action model. Without it the delta is forced "
+                         "to zero and this measures the RAW sim-to-real gap; with it, "
+                         "how much of that gap the model closes. Same protocol either "
+                         "way, so the two numbers are directly comparable.")
     ap.add_argument("--out", default="/tmp/replay.npz")
     args = ap.parse_args()
 
@@ -80,7 +85,8 @@ def main():
     config.robot.motion.motion_file = motion_file
     config.num_envs = n_motions
     config.headless = True
-    config.env.config.zero_delta_a = True       # delta action forced to 0
+    # zero_delta_a is the baseline condition; with a checkpoint we let the model act.
+    config.env.config.zero_delta_a = args.delta_checkpoint is None
     config.env.config.add_extra_action = True   # replay the recorded action
     config.env.config.noise_to_initial_level = 0
     config.env.config.max_episode_length_s = 20
@@ -113,7 +119,18 @@ def main():
 
     env = instantiate(config.env, device=device)
     env.set_is_evaluating()   # deterministic motion set, not a random 128-of-404
-    env.reset_all()
+    obs_dict = env.reset_all()
+
+    delta_policy = None
+    if args.delta_checkpoint:
+        algo = instantiate(config.algo, env=env, device=device, log_dir=None)
+        algo.setup()
+        algo.load(args.delta_checkpoint)
+        algo._eval_mode()
+        delta_policy = algo._get_inference_policy()
+        logger.info(f"delta model loaded: {args.delta_checkpoint}")
+    else:
+        logger.info("no delta checkpoint -- measuring the RAW gap (delta = 0)")
     ml = env._motion_lib
     ndof = env.num_dofs
 
@@ -140,7 +157,7 @@ def main():
     ref_root = np.zeros((B, H, n_env, 3), np.float32)
 
     for b in range(B):
-        env.reset_all()          # re-anchors every env to the real state at a new t0
+        obs_dict = env.reset_all()   # re-anchors every env to the real state at a new t0
         for h in range(H):
             times = env.episode_length_buf * env.dt + env.motion_start_times
             st = ml.get_motion_state(env.motion_ids, times)
@@ -148,7 +165,11 @@ def main():
             ref_root[b, h] = st["root_pos"].cpu().numpy()
             sim_dof[b, h] = env.simulator.dof_pos.cpu().numpy()
             sim_root[b, h] = (env.simulator.robot_root_states[:, :3] - env_org).cpu().numpy()
-            env.step({"actions": zero_act})
+            if delta_policy is not None:
+                act = delta_policy(obs_dict["actor_obs"]).detach()
+            else:
+                act = zero_act
+            obs_dict, _, _, _ = env.step({"actions": act})
         if (b + 1) % 5 == 0:
             e = np.degrees(np.abs(sim_dof[b] - ref_dof[b]))
             logger.info(f"  batch {b+1}/{B}: mean {e.mean():.2f} deg at horizon {H}")
@@ -161,6 +182,8 @@ def main():
     )
     e = np.degrees(np.abs(sim_dof - ref_dof))
     logger.info(f"wrote {out_path}")
+    tag = "WITH delta model" if delta_policy is not None else "baseline (delta = 0)"
+    logger.info(f"  condition: {tag}")
     for frac in (0.25, 0.5, 1.0):
         k = min(int(frac * 49), H - 1)
         logger.info(f"  open-loop MPJPE @{frac:.2f}s : {e[:, k].mean():.3f} deg")
