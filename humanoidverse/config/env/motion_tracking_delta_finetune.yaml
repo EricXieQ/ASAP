@@ -1,0 +1,14 @@
+# @package _global_
+
+defaults:
+  - motion_tracking
+
+# Stage (c): fine-tune the tracking policy inside a simulator corrected by a
+# FROZEN delta action model. Point delta_checkpoint at a trained delta model;
+# leave it null for the control arm (same recipe, uncorrected simulator).
+env:
+  _target_: humanoidverse.envs.motion_tracking.motion_tracking_delta_finetune.MotionTrackingDeltaFinetune
+  config:
+    delta_checkpoint: null
+
+log_task_name: motion_tracking_delta_finetune

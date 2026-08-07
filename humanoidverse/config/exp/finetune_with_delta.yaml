@@ -1,0 +1,7 @@
+# @package _global_
+
+defaults:
+  - /algo: ppo
+  - /env: motion_tracking_delta_finetune
+
+experiment_name: Finetune_With_Delta
