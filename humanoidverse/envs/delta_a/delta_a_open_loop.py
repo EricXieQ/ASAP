@@ -106,6 +106,24 @@ class DeltaA_OpenLoop(LeggedRobotMotionTracking):
         else:
             return torques
         
+    def _reward_penalty_action_norm_sq(self):
+        """Quadratic penalty on the size of the delta correction.
+
+        The existing minimal_action_norm reward is exp(-||a||), whose gradient
+        vanishes exactly where you need it: 0.37 at ||a||=1, but 2e-5 at ||a||=10.7.
+        The 4-DoF delta escaped that region in the first quarter of training and then
+        grew freely, ending at ||a||~10.7 with the penalty logging exactly 0.0000. By
+        then it was a co-controller rather than a correction -- its ankle action
+        reached 92% of the policy's own without domain randomisation and 209% with it
+        -- and since the delta model is deleted at deployment, the fine-tuned policies
+        could not balance in MuJoCo at all.
+
+        A quadratic pushes harder the larger the correction gets, so there is no
+        region where it stops mattering. Returns a positive quantity; configure with
+        a NEGATIVE weight, matching penalty_action_rate.
+        """
+        return torch.sum(torch.square(self.actions), dim=1)
+
     def _reward_minimal_action_norm(self):
         # exp(-norm(actions))
         return torch.exp(-torch.norm(self.actions, dim=-1))

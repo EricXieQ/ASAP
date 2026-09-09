@@ -32,6 +32,10 @@ rewards:
       minimal_action_norm: -0.0
       normalized_penalty_minimal_action_norm: 0.0 # positive coef for this negative penalty
       penalty_minimal_action_norm: -0.0
+      # Non-saturating alternative to minimal_action_norm. Set this NEGATIVE and
+      # minimal_action_norm to 0 to keep the delta a correction rather than a
+      # co-controller. See _reward_penalty_action_norm_sq for why exp(-||a||) fails.
+      penalty_action_norm_sq: -0.0
 
   teleop_body_pos_lowerbody_weight : 0.5
   teleop_body_pos_upperbody_weight : 1.0
