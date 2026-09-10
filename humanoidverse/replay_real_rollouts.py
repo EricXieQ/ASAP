@@ -64,8 +64,24 @@ def main():
                          "to zero and this measures the RAW sim-to-real gap; with it, "
                          "how much of that gap the model closes. Same protocol either "
                          "way, so the two numbers are directly comparable.")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="make the scored sample identical across conditions: the same "
+                         "clips and the same start times. Without it neither holds. The "
+                         "motion library is loaded during env construction with "
+                         "random_sample=True and draws via torch.multinomial from an "
+                         "unseeded RNG, so each process scores a DIFFERENT random subset "
+                         "of the dataset (set_is_evaluating only runs afterwards and does "
+                         "not affect that load). Start times then diverge too. Comparing "
+                         "two models without this compares them on different data. "
+                         "Default None leaves the previous behaviour untouched.")
     ap.add_argument("--out", default="/tmp/replay.npz")
     args = ap.parse_args()
+
+    if args.seed is not None:
+        # BEFORE env construction, which is where the motion subset is drawn.
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
     # registers the ${eval:}/${if:}/${sqrt:} resolvers the saved config uses
     import humanoidverse.utils.config_utils  # noqa: F401
@@ -156,7 +172,21 @@ def main():
     sim_root = np.zeros((B, H, n_env, 3), np.float32)
     ref_root = np.zeros((B, H, n_env, 3), np.float32)
 
+    if args.seed is not None:
+        logger.info(f"seeded with {args.seed} before env construction, and re-seeded "
+                    f"per batch: same clips and same start times across conditions")
+
     for b in range(B):
+        if args.seed is not None:
+            # Per batch, not once before the loop. Seeding once is not enough: envs
+            # whose random t0 lands near the end of a clip hit terminate_when_motion_end
+            # mid-horizon and resample, and the rollout itself may draw, so by batch 2
+            # the conditions have consumed different amounts of RNG. Re-seeding here
+            # makes the start times a pure function of (seed, batch index) and of
+            # nothing the policy did.
+            torch.manual_seed(args.seed + b)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(args.seed + b)
         obs_dict = env.reset_all()   # re-anchors every env to the real state at a new t0
         for h in range(H):
             times = env.episode_length_buf * env.dt + env.motion_start_times
