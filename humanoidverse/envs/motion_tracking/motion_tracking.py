@@ -266,12 +266,24 @@ class LeggedRobotMotionTracking(LeggedRobotBase):
         self.reset_envs_idx(torch.arange(self.num_envs, device=self.device))
 
 
+    def _reference_lead_steps(self):
+        """Control steps by which the tracking reference leads the simulated state.
+
+        1 is the upstream motion-tracking convention: this callback runs AFTER
+        `episode_length_buf += 1` (legged_robot_base.py:239), so the state here is at
+        `episode_length_buf * dt` and the reference is one step further on -- the target
+        the policy should steer toward next. Harmless for imitation, where absolute
+        phase is not observable. System-identification environments must override this
+        to 0; see delta_a_open_loop.
+        """
+        return 1
+
     def _pre_compute_observations_callback(self):
         super()._pre_compute_observations_callback()
         
         offset = self.env_origins
         B = self.motion_ids.shape[0]
-        motion_times = (self.episode_length_buf + 1) * self.dt + self.motion_start_times # next frames so +1
+        motion_times = (self.episode_length_buf + self._reference_lead_steps()) * self.dt + self.motion_start_times
         # motion_res = self._get_state_from_motionlib_cache_trimesh(self.motion_ids, motion_times, offset= offset)
         motion_res = self._motion_lib.get_motion_state(self.motion_ids, motion_times, offset=offset)
 

@@ -152,11 +152,23 @@ class DeltaA_OpenLoop(LeggedRobotMotionTracking):
         return torch.exp(torch.norm(self.actions, dim=-1))-1
         # return torch.clip(torch.exp(torch.norm(self.actions, dim=-1))-1, -1000, 1000)
         
-    def get_open_loop_action_at_current_timestep(self):
-        motion_times = (self.episode_length_buf + 1) * self.dt + self.motion_start_times
-        motion_action = self._motion_lib.get_motion_actions(self.motion_ids, motion_times)
+    def _reference_lead_steps(self):
+        """0: this is system identification, not motion tracking.
 
-        return motion_action
+        The reset anchors the robot at `motion_start_times + episode_length_buf * dt`
+        (motion_tracking._reset_dofs:554, _reset_root_states:443/460), so the state after
+        physics is at that same time and must be scored against the reference there.
+        Scoring one step further on asks one dt of physics to cover two dt of recording.
+        """
+        return 0
+
+    def get_open_loop_action_at_current_timestep(self):
+        # rl_sar records `a_real[j]` as the command computed FROM `s_real[j]` and queues
+        # it afterwards (rl_real_g1.cpp:296-303, 323-334), so it is the command in force
+        # from t_j onward. get_motion_actions floor-samples, which is the correct
+        # zero-order hold. Read it at the CURRENT sim time, not one step ahead.
+        motion_times = self.episode_length_buf * self.dt + self.motion_start_times
+        return self._motion_lib.get_motion_actions(self.motion_ids, motion_times)
     
     # NOTE: this is the perfect delta_a for 0.65Kp scenario
     def _get_perfect_delta_a(self):
